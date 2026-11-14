@@ -97,6 +97,12 @@ html, body {
   position: absolute;
   inset: 0;
   display: none;
+  /* 觸控（電子白板／平板）：整個畫面都當作拖曳區。
+     注意 touch-action 只對 HTML 元素有效，設在 SVG 的 <g class="apple-node"> 上沒有用，
+     所以一定要設在這一層，否則瀏覽器會把手勢判成捲動並送出 pointercancel，
+     觸控拖曳就會在半途斷掉（滑鼠不受影響）。 */
+  touch-action: none;
+  overscroll-behavior: contain;
 }
 .screen.active { display: block; }
 

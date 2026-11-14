@@ -110,6 +110,12 @@ html, body {
   position: absolute;
   inset: 0;
   display: none;
+  /* 觸控（電子白板／平板）：整個畫面都當作拖曳區。
+     注意 touch-action 只對 HTML 元素有效，設在 SVG 的 <g class="apple-node"> 上沒有用，
+     所以一定要設在這一層，否則瀏覽器會把手勢判成捲動並送出 pointercancel，
+     觸控拖曳就會在半途斷掉（滑鼠不受影響）。 */
+  touch-action: none;
+  overscroll-behavior: contain;
 }
 .screen.active { display: block; }
 
@@ -3039,46 +3045,132 @@ AP.Game = (function () {
       y: (e.clientY - r.top) * (960 / r.height)
     };
   }
+  function clientToArt(clientX, clientY) {
+    const r = els.stage.getBoundingClientRect();
+    return {
+      x: (clientX - r.left) * (1280 / r.width),
+      y: (clientY - r.top) * (960 / r.height)
+    };
+  }
+
+  /* 是否落在譜面帶內（拖放判定用；上下各放寬一點，邊緣也好放） */
+  function inPanel(x, y) {
+    return x > G.x0 + 10 && x < G.x1 - 10 && y > G.panelTop - 34 && y < G.panelTop + G.panelH + 34;
+  }
+
+  /* ---------- 拖曳：pointer / touch / mouse 三種事件共用同一套邏輯 ---------- */
+  function dragStart(a, n, clientX, clientY, pointerId) {
+    if (a.placed || S.drag || !S.running) return;
+    AP.sfx.unlock();
+    const p = clientToArt(clientX, clientY);
+    a.lastLocal = null;
+    S.drag = { apple: a, dx: a.x - p.x, dy: a.y - p.y, moved: false, sx: p.x, sy: p.y, id: pointerId };
+    /* 注意：拖曳期間不可把節點搬移到別的圖層或改變 DOM 位置。
+       觸控有「隱式指標捕獲」，節點一被移出原位，瀏覽器會送出 pointercancel，
+       觸控拖曳就會在半途被取消（滑鼠不受影響）。
+       蘋果原本就疊在 notesLayer 之上，留在原位即可。 */
+    n.classList.add('dragging');
+    setPos(a, p.x + S.drag.dx, p.y + S.drag.dy, DRAG_SCALE, false);
+    AP.sfx.note(a.pitch.midi, { dur: 0.5, gain: 0.18 });
+    selectApple(null);
+  }
+
+  function dragMove(a, clientX, clientY) {
+    if (!S.drag || S.drag.apple !== a) return;
+    const p = clientToArt(clientX, clientY);
+    if (Math.abs(p.x - S.drag.sx) + Math.abs(p.y - S.drag.sy) > 5) S.drag.moved = true;
+    const x = p.x + S.drag.dx, y = p.y + S.drag.dy;
+    if (inPanel(x, y)) a.lastLocal = { x: x, y: y };
+    setPos(a, x, y, DRAG_SCALE, false);
+    if (S.drag.moved) showGhost(y, x);
+  }
+
+  function dragEnd(a, n, clientX, clientY, cancelled) {
+    if (!S.drag || S.drag.apple !== a) return;
+    const p = clientToArt(clientX, clientY);
+    const moved = S.drag.moved;
+    let x = p.x + S.drag.dx, y = p.y + S.drag.dy;
+    S.drag = null;
+    n.classList.remove('dragging');
+    hideGhost();
+    if (!moved && !cancelled) { selectApple(a); setPos(a, a.x, a.y, TREE_SCALE, true); return; }
+    // 手指被系統取消、或放開位置稍微滑出譜面 → 退回最後一個在譜面上的位置
+    if (!inPanel(x, y) && a.lastLocal) { x = a.lastLocal.x; y = a.lastLocal.y; }
+    if (inPanel(x, y)) tryPlace(a, y, x);
+    else flyHome(a);
+  }
 
   function bindAppleNode(a) {
     const n = a.node;
-    n.addEventListener('pointerdown', (e) => {
-      if (a.placed || S.drag || !S.running) return;
+
+    /* --- 1) Pointer Events（桌機、Chrome / Edge / Safari 平板） --- */
+    if (window.PointerEvent) {
+      n.addEventListener('pointerdown', (e) => {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        // 已經有一根手指在拖 → 忽略其他手指，避免多點觸控打架
+        if (S.drag) return;
+        e.preventDefault();
+        dragStart(a, n, e.clientX, e.clientY, e.pointerId);
+        // 明確捕捉：手指滑出蘋果範圍仍能收到 move / up
+        try { n.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+      });
+      n.addEventListener('pointermove', (e) => {
+        if (!S.drag || S.drag.id !== e.pointerId) return;
+        e.preventDefault();
+        dragMove(a, e.clientX, e.clientY);
+      });
+      n.addEventListener('pointerup', (e) => {
+        if (!S.drag || S.drag.id !== e.pointerId) return;
+        const cx = e.clientX, cy = e.clientY;
+        try { n.releasePointerCapture(e.pointerId); } catch (err) { /* noop */ }
+        dragEnd(a, n, cx, cy, false);
+      });
+      // 被系統取消（手勢判定、來電、白板驅動切換…）：已拖到譜面上就照樣放下
+      n.addEventListener('pointercancel', (e) => {
+        if (!S.drag || S.drag.id !== e.pointerId) return;
+        dragEnd(a, n, e.clientX, e.clientY, true);
+      });
+      return;
+    }
+
+    /* --- 2) 舊版瀏覽器 / 部分電子白板只有 Touch Events → 後備處理 --- */
+    const findTouch = (list) => {
+      for (let i = 0; i < list.length; i++) {
+        if (S.drag && list[i].identifier === S.drag.id) return list[i];
+        if (!S.drag && i === 0) return list[i];
+      }
+      return null;
+    };
+    n.addEventListener('touchstart', (e) => {
+      if (S.drag) return;
+      const t = e.changedTouches[0];
+      if (!t) return;
       e.preventDefault();
-      AP.sfx.unlock();
-      const p = toStage(e);
-      S.drag = { apple: a, dx: a.x - p.x, dy: a.y - p.y, moved: false, sx: p.x, sy: p.y };
-      notesLayer.appendChild(n);
-      n.classList.add('dragging');
-      setPos(a, p.x + S.drag.dx, p.y + S.drag.dy, DRAG_SCALE, false);
-      AP.sfx.note(a.pitch.midi, { dur: 0.5, gain: 0.18 });
-      selectApple(null);
-      try { n.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+      dragStart(a, n, t.clientX, t.clientY, t.identifier);
+    }, { passive: false });
+    n.addEventListener('touchmove', (e) => {
+      const t = findTouch(e.changedTouches);
+      if (!t) return;
+      e.preventDefault();
+      dragMove(a, t.clientX, t.clientY);
+    }, { passive: false });
+    n.addEventListener('touchend', (e) => {
+      const t = findTouch(e.changedTouches);
+      if (!t) return;
+      e.preventDefault();
+      dragEnd(a, n, t.clientX, t.clientY, false);
+    }, { passive: false });
+    n.addEventListener('touchcancel', (e) => {
+      const t = findTouch(e.changedTouches) || { clientX: 0, clientY: 0 };
+      dragEnd(a, n, t.clientX, t.clientY, true);
     });
-    n.addEventListener('pointermove', (e) => {
-      if (!S.drag || S.drag.apple !== a) return;
-      const p = toStage(e);
-      if (Math.abs(p.x - S.drag.sx) + Math.abs(p.y - S.drag.sy) > 7) S.drag.moved = true;
-      const x = p.x + S.drag.dx, y = p.y + S.drag.dy;
-      setPos(a, x, y, DRAG_SCALE, false);
-      if (S.drag.moved) showGhost(y, x);
-    });
-    n.addEventListener('pointerup', (e) => {
-      if (!S.drag || S.drag.apple !== a) return;
-      const p = toStage(e);
-      const moved = S.drag.moved;
-      const x = p.x + S.drag.dx, y = p.y + S.drag.dy;
-      S.drag = null;
-      n.classList.remove('dragging');
-      hideGhost();
-      if (!moved) { selectApple(a); setPos(a, a.x, a.y, TREE_SCALE, true); return; }
-      if (x < G.x0 - 160 || x > G.x1 + 160 || y < 380 || y > 900) { flyHome(a); return; }
-      tryPlace(a, y, x);
-    });
-    n.addEventListener('pointercancel', () => {
-      if (!S.drag || S.drag.apple !== a) return;
-      S.drag = null; hideGhost(); n.classList.remove('dragging'); flyHome(a);
-    });
+
+    /* --- 3) 只剩滑鼠事件（極舊環境） --- */
+    if (!('ontouchstart' in window)) {
+      n.addEventListener('mousedown', (e) => { if (e.button === 0) { e.preventDefault(); dragStart(a, n, e.clientX, e.clientY, 'mouse'); } });
+      window.addEventListener('mousemove', (e) => dragMove(a, e.clientX, e.clientY));
+      window.addEventListener('mouseup', (e) => dragEnd(a, n, e.clientX, e.clientY, false));
+    }
   }
 
   function flyHome(a) {
